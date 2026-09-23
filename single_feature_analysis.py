@@ -1,405 +1,254 @@
 #!/usr/bin/env python3
 """
-Single-feature analysis untuk dataset sliding-window.
+Analisis fitur tunggal dengan RAM rendah menggunakan DuckDB.
 
-Tujuan script ini:
-1. Membaca dataset window yang sudah punya target `t+1` OR membuat target dari raw + windows.
-2. Mengevaluasi setiap fitur terhadap target utama, misalnya `target_ge_2`.
-3. Mengukur apakah fitur punya lift yang konsisten vs baseline global.
-4. Mengelompokkan hasil berdasarkan ukuran window agar tidak terlalu bias karena overlap.
-5. Menghasilkan ringkasan yang mudah dikirim kembali untuk interpretasi.
+Versi ini dibuat untuk dataset sliding-window besar, misalnya jutaan baris
+Parquet. Script lama memuat seluruh dataset ke pandas lalu membuat banyak
+copy DataFrame dan bucket per fitur. Itu dapat menghabiskan RAM belasan GB.
 
-Fungsi utama:
-    - fitur numerik -> membagi ke beberapa bucket (qcut) lalu menghitung p(target)
-    - fitur boolean / count -> evaluasi per nilai 0/1 atau threshold tertentu
-    - output ringkas per fitur dan per kelompok ukuran window
+Script ini:
+- membaca Parquet secara lazy melalui DuckDB;
+- hanya mengambil kolom yang diperlukan;
+- tidak memuat seluruh 8+ juta baris ke RAM;
+- menghitung target t+1 melalui mapping kecil dari 410_kalibrasi.md;
+- mengagregasi hasil langsung di DuckDB;
+- menulis output kecil berupa tabel ringkasan.
 
-Contoh pemakaian:
-    python single_feature_analysis.py \
-        --data audited_windows_with_targets.csv \
-        --out feature_analysis
+Install:
+    pip install duckdb pandas
 
-    atau jika dataset belum punya target:
+Contoh:
     python single_feature_analysis.py \
         --raw 410_kalibrasi.md \
         --windows 410_kalibrasi10_2000_raw.parquet \
         --out feature_analysis
 
-Catatan penting:
-    - Data window sangat overlap. Jangan langsung menganggap semua baris sebagai sample independen.
-    - Saat interpretasi, fokus pada signal yang konsisten lintas window_size.
-    - Output ringkas yang perlu dikirim kembali: feature_window_group_summary.csv dan top_features.csv.
+Jika dataset window sudah memiliki kolom target, opsi --raw tetap boleh
+diberikan tetapi tidak diperlukan. Untuk efisiensi, gunakan Parquet, bukan CSV.
+
+Output:
+    feature_bucket_summary.csv
+    feature_window_group_summary.csv
+    top_features.csv
+    feature_analysis_summary.json
+
+Catatan metodologis:
+- Window saling overlap, sehingga jutaan baris bukan jutaan sample independen.
+- Hasil script ini adalah eksplorasi, bukan bukti prediktabilitas.
+- Signal harus dicek lagi dengan validasi kronologis/walk-forward.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from io import StringIO
 from pathlib import Path
-from typing import Any
 
+import duckdb
 import pandas as pd
 
-TARGET_FIELDS = ["target_gr", "target_low"]
 THRESHOLDS = [2, 5, 10, 20, 50, 100]
-TARGET_COLUMNS = [f"target_ge_{threshold}" for threshold in THRESHOLDS]
+WINDOW_GROUP_CASE = """
+CASE
+  WHEN window_size <= 10 THEN '<=10'
+  WHEN window_size <= 30 THEN '11-30'
+  WHEN window_size <= 50 THEN '31-50'
+  WHEN window_size <= 100 THEN '51-100'
+  WHEN window_size <= 250 THEN '101-250'
+  WHEN window_size <= 500 THEN '251-500'
+  WHEN window_size <= 1000 THEN '501-1000'
+  WHEN window_size <= 2000 THEN '1001-2000'
+  ELSE '>2000'
+END
+"""
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Analisis fitur tunggal untuk dataset window dengan target t+1."
-    )
-    parser.add_argument(
-        "--data",
-        type=Path,
-        default=None,
-        help="Path dataset window yang sudah memiliki target (CSV/Parquet).",
-    )
-    parser.add_argument(
-        "--raw",
-        type=Path,
-        default=None,
-        help="Path ke raw markdown (opsional, dipakai hanya jika --data tidak ada).",
-    )
-    parser.add_argument(
-        "--windows",
-        type=Path,
-        default=None,
-        help="Path ke window dataset (CSV/Parquet), hanya untuk membangun target jika --data tidak ada.",
-    )
-    parser.add_argument(
-        "--out",
-        type=Path,
-        default=Path("feature_analysis"),
-        help="Direktori output; default: feature_analysis.",
-    )
-    return parser.parse_args()
+def args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="RAM-efficient single-feature analysis")
+    p.add_argument("--raw", type=Path, required=False, help="410_kalibrasi.md")
+    p.add_argument("--windows", type=Path, required=True, help="CSV/Parquet windows")
+    p.add_argument("--out", type=Path, default=Path("feature_analysis"))
+    p.add_argument("--threads", type=int, default=2, help="DuckDB threads; default 2")
+    p.add_argument("--memory-limit", default="4GB", help="DuckDB memory limit")
+    return p.parse_args()
 
 
-def read_raw_markdown(path: Path) -> pd.DataFrame:
-    """Baca file 410_kalibrasi.md seperti pada script audit sebelumnya."""
+def read_raw(path: Path) -> pd.DataFrame:
     text = path.read_text(encoding="utf-8")
-    table_lines = [line.strip() for line in text.splitlines() if line.lstrip().startswith("|")]
-    if len(table_lines) < 3:
-        raise ValueError(f"Tidak menemukan tabel Markdown valid di {path}")
-
-    from io import StringIO
+    lines = [x.strip() for x in text.splitlines() if x.lstrip().startswith("|")]
+    if len(lines) < 3:
+        raise ValueError(f"Tabel Markdown tidak ditemukan: {path}")
 
     normalized = []
-    for line in table_lines:
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
+    for line in lines:
+        cells = [c.strip() for c in line.strip("|").split("|")]
         if cells and cells[0] == "":
             cells = cells[1:]
         normalized.append("|" + "|".join(cells) + "|")
 
-    csv_like = "\n".join(normalized)
-    raw = pd.read_csv(StringIO(csv_like), sep="|", engine="python")
-    raw = raw.dropna(axis=1, how="all").reset_index(drop=True)
+    raw = pd.read_csv(StringIO("\n".join(normalized)), sep="|", engine="python")
+    raw = raw.dropna(axis=1, how="all")
     raw.columns = [str(c).strip() for c in raw.columns]
-    raw = raw.loc[:, [c for c in raw.columns if c != ""]].copy()
-
-    if "game_id" not in raw.columns or "gr_result" not in raw.columns:
-        raise ValueError("Raw data harus punya kolom 'game_id' dan 'gr_result'.")
-
+    raw = raw.loc[:, [c for c in raw.columns if c]]
     raw["game_id"] = pd.to_numeric(raw["game_id"], errors="coerce")
     raw["gr_result"] = pd.to_numeric(raw["gr_result"], errors="coerce")
-    raw = raw.dropna(subset=["game_id", "gr_result"]).copy()
+    raw = raw.dropna(subset=["game_id", "gr_result"])
     raw["game_id"] = raw["game_id"].astype("int64")
-    raw = raw.drop_duplicates(subset=["game_id"], keep="last").sort_values("game_id").reset_index(drop=True)
-    return raw
+    raw = raw.drop_duplicates("game_id").reset_index(drop=True)
 
-
-def read_windows(path: Path) -> pd.DataFrame:
-    """Baca file window dari CSV atau Parquet."""
-    suffix = path.suffix.lower()
-    if suffix == ".parquet":
-        df = pd.read_parquet(path)
-    elif suffix == ".csv":
-        df = pd.read_csv(path)
-    else:
-        raise ValueError("File windows harus .csv atau .parquet")
-
-    df.columns = [str(c).strip() for c in df.columns]
-    for c in ["window_size", "window_start", "window_end", "first_game_id", "last_game_id"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-
-def build_target_frame(raw: pd.DataFrame, windows: pd.DataFrame) -> pd.DataFrame:
-    """Membuat target t+1 untuk setiap row window."""
-    result = windows.copy()
-    raw_index = raw.drop_duplicates("game_id").set_index("game_id")
-
-    # target_game_id = game yang menjadi ronde setelah window
-    game_to_next = {}
-    ordered = raw["game_id"].astype(int).tolist()
-    for i in range(len(ordered) - 1):
-        game_to_next[ordered[i]] = ordered[i + 1]
-
-    result["target_game_id"] = result["last_game_id"].map(game_to_next)
-    result["target_gr"] = result["target_game_id"].map(raw_index["gr_result"])
-
-    # Pastikan target tidak berisi data dari window itu sendiri
-    result["target_is_same_as_last"] = result["target_game_id"] == result["last_game_id"]
-    result["target_low"] = result["target_gr"] < 2
-    for threshold in THRESHOLDS:
-        result[f"target_ge_{threshold}"] = result["target_gr"] >= threshold
-
-    # Hapus row tanpa target pada akhir dataset (normal untuk window terbesar)
-    result = result.dropna(subset=["target_gr"]).reset_index(drop=True)
-    return result
-
-
-def candidate_features(df: pd.DataFrame) -> list[str]:
-    """Pilih fitur kandidat yang layak diukur. Target columns dan ID metadata dikeluarkan."""
-    exclude = {
-        "window_no",
-        "window_start",
-        "window_end",
-        "window_size",
-        "first_game_id",
-        "last_game_id",
-        "first_tag_ts",
-        "last_ts_gr",
-        "first_tag_ts_iso",
-        "target_game_id",
-        "target_gr",
-        "target_low",
-        "raw_order",
-    }
-    exclude |= {f"target_ge_{t}" for t in THRESHOLDS}
-    exclude |= {"target_is_same_as_last"}
-
-    columns = []
-    for col in df.columns:
-        if col in exclude:
-            continue
-        if col.startswith("target_"):
-            continue
-        if col.startswith("first_") and col not in {"first_game_id", "first_tag_ts", "first_tag_ts_iso"}:
-            # tetap boleh dipakai jika memang feature; tapi yang umum di window sudah masuk daftar.
-            pass
-        columns.append(col)
-
-    # Hapus feature kolom yang identik dengan target (jika punya)
-    safe = []
-    for col in columns:
-        if col in {"last_gr", "max_gr", "mean_gr", "min_gr"}:
-            safe.append(col)
-        elif df[col].nunique(dropna=True) > 1:
-            safe.append(col)
-    return safe
-
-
-def safe_bucket_numeric(series: pd.Series, n_bins: int = 5) -> pd.Series:
-    """Buat bucket numerik dengan guard jika nilai terlalu sedikit atau semua sama."""
-    s = series.dropna()
-    if s.empty:
-        return pd.Series(pd.NA, index=series.index, dtype="object")
-
-    if s.nunique() <= 1:
-        return s.astype(str)
-
-    try:
-        bins = pd.qcut(s, q=min(n_bins, s.nunique()), duplicates="drop")
-        return pd.Series(bins.astype(str), index=s.index)
-    except Exception:
-        ordered = s.sort_values().unique()
-        labels = []
-        for val in s:
-            labels.append(str(val))
-        return pd.Series(labels, index=s.index)
-
-
-def make_bucket_summary(df: pd.DataFrame, feature: str) -> pd.DataFrame:
-    """Ringkas satu fitur menjadi bucket per nilai / quantile."""
-    series = df[feature]
-    if pd.api.types.is_bool_dtype(series) or series.nunique(dropna=True) <= 2:
-        # fitur boolean / binary
-        out = series.to_frame(name=feature).copy()
-        out["bucket"] = out[feature].astype(str)
-    else:
-        # numerik -> qcut
-        out = pd.DataFrame({feature: series})
-        out["bucket"] = safe_bucket_numeric(out[feature], n_bins=5)
-
-    merged = pd.concat([df[["target_low"] + [f"target_ge_{t}" for t in THRESHOLDS]], out], axis=1)
-    merged = merged.dropna(subset=["bucket"]).copy()
-
-    rows = []
-    for bucket, group in merged.groupby("bucket", dropna=True):
-        n = len(group)
-        row = {
-            "feature": feature,
-            "bucket": str(bucket),
-            "n": int(n),
-            "low_rate": float(group["target_low"].mean()),
+    ids = raw["game_id"].tolist()
+    next_ids = ids[1:] + [None]
+    mapping = pd.DataFrame(
+        {
+            "last_game_id": ids,
+            "target_game_id": next_ids,
+            "target_gr": raw["gr_result"].tolist()[1:] + [None],
         }
-        for threshold in THRESHOLDS:
-            col = f"target_ge_{threshold}"
-            row[f"p_ge_{threshold}"] = float(group[col].mean())
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def summarize_by_window_group(df: pd.DataFrame, feature: str) -> pd.DataFrame:
-    """Agregasi stabilitas fitur per kelompok ukuran window."""
-    data = df[["window_size", feature, "target_low"] + [f"target_ge_{t}" for t in THRESHOLDS]].copy()
-    data["window_group"] = pd.cut(
-        data["window_size"],
-        bins=[0, 10, 30, 50, 100, 250, 500, 1000, 2000, 999999],
-        labels=["<=10", "11-30", "31-50", "51-100", "101-250", "251-500", "501-1000", "1001-2000", ">2000"],
-        right=False,
-        include_lowest=True,
     )
-
-    rows = []
-    for group_name, group in data.groupby("window_group", dropna=False):
-        if len(group) == 0:
-            continue
-        feature_values = group[feature].dropna()
-        if feature_values.empty:
-            continue
-
-        # Jika feature numerik, bucket menurut quantile untuk mengurangi outlier effect
-        local = group.copy()
-        if pd.api.types.is_numeric_dtype(local[feature]):
-            local["bucket"] = safe_bucket_numeric(local[feature], n_bins=5)
-        else:
-            local["bucket"] = local[feature].astype(str)
-
-        for bucket, sub in local.groupby("bucket", dropna=True):
-            row = {
-                "feature": feature,
-                "window_group": str(group_name),
-                "bucket": str(bucket),
-                "n": int(len(sub)),
-                "low_rate": float(sub["target_low"].mean()),
-            }
-            for threshold in THRESHOLDS:
-                row[f"p_ge_{threshold}"] = float(sub[f"target_ge_{threshold}"].mean())
-            rows.append(row)
-
-    return pd.DataFrame(rows)
+    return mapping
 
 
-def compute_top_features(summary: pd.DataFrame, baseline: dict[str, float]) -> pd.DataFrame:
-    """Urutkan fitur berdasarkan kekuatan lift relatif terhadap baseline."""
-    out_rows = []
-    for feature in sorted(summary["feature"].unique()):
-        subset = summary[summary["feature"] == feature].copy()
-        if subset.empty:
-            continue
-
-        # Main metric: p_ge_2 relative to baseline global
-        base = baseline["p_ge_2"]
-        lift_values = []
-        for _, row in subset.iterrows():
-            p = row.get("p_ge_2")
-            if pd.notna(p):
-                lift_values.append(float(p / base) if base else 1.0)
-
-        if not lift_values:
-            continue
-
-        out_rows.append(
-            {
-                "feature": feature,
-                "avg_p_ge_2": float(subset["p_ge_2"].mean()),
-                "max_p_ge_2": float(subset["p_ge_2"].max()),
-                "avg_lift_vs_baseline": float(sum(lift_values) / len(lift_values)),
-                "max_lift_vs_baseline": float(max(lift_values)),
-                "n_buckets": int(len(subset)),
-            }
-        )
-
-    top = pd.DataFrame(out_rows).sort_values(
-        ["avg_lift_vs_baseline", "max_lift_vs_baseline"],
-        ascending=False,
-    )
-    return top.reset_index(drop=True)
+def sql_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 
 def main() -> None:
-    args = parse_args()
-    args.out.mkdir(parents=True, exist_ok=True)
+    a = args()
+    if a.windows.suffix.lower() not in {".parquet", ".csv"}:
+        raise ValueError("--windows harus berupa .parquet atau .csv")
+    if a.raw is None:
+        raise ValueError("--raw diperlukan untuk membangun target t+1")
 
-    if args.data is not None:
-        data_path = args.data
-        df = pd.read_parquet(data_path) if data_path.suffix.lower() == ".parquet" else pd.read_csv(data_path)
-    elif args.raw is not None and args.windows is not None:
-        raw = read_raw_markdown(args.raw)
-        windows = read_windows(args.windows)
-        df = build_target_frame(raw, windows)
-    else:
-        raise ValueError("Harus sediakan --data ATAU --raw + --windows")
+    a.out.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"SET memory_limit='{a.memory_limit}'")
+    con.execute(f"SET threads={max(1, a.threads)}")
+    con.execute("SET preserve_insertion_order=false")
+    con.register("target_map", read_raw(a.raw))
 
-    df.columns = [str(c).strip() for c in df.columns]
-    required = ["target_low"] + [f"target_ge_{t}" for t in THRESHOLDS]
-    missing = [c for c in required if c not in df.columns]
+    source = f"read_parquet('{a.windows.as_posix()}')" if a.windows.suffix.lower() == ".parquet" else f"read_csv_auto('{a.windows.as_posix()}', header=true)"
+    cols = [x[0] for x in con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()]
+    required = {"window_size", "last_game_id"}
+    missing = required - set(cols)
     if missing:
-        raise ValueError(f"Dataset tidak punya target yang dibutuhkan. Kolom hilang: {missing}")
+        raise ValueError(f"Kolom window hilang: {sorted(missing)}")
 
-    baseline = {
-        "p_ge_2": float(df["target_ge_2"].mean()),
-        "p_ge_5": float(df["target_ge_5"].mean()),
-        "p_ge_10": float(df["target_ge_10"].mean()),
-        "p_ge_20": float(df["target_ge_20"].mean()),
-        "p_ge_50": float(df["target_ge_50"].mean()),
-        "p_ge_100": float(df["target_ge_100"].mean()),
+    excluded = {
+        "window_size", "window_no", "window_start", "window_end",
+        "first_game_id", "last_game_id", "first_tag_ts", "first_tag_ts_iso",
+        "last_ts_gr", "last_cat", "target_gr", "target_game_id",
     }
+    features = [c for c in cols if c not in excluded and not c.startswith("target_")]
+    # Hanya analisis kolom numerik/bool yang memang ada di schema.
+    schema = {r[0]: r[1].upper() for r in con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()}
+    features = [c for c in features if any(t in schema[c] for t in ("INT", "DECIMAL", "DOUBLE", "FLOAT", "BOOL", "HUGEINT"))]
+    if not features:
+        raise ValueError("Tidak ada fitur numerik/bool untuk dianalisis")
 
-    feature_list = candidate_features(df)
-    bucket_summaries = []
-    by_window_group = []
+    feature_sql = ", ".join(sql_ident(c) for c in ["window_size", "last_game_id", *features])
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW base AS
+        SELECT w.*, m.target_gr
+        FROM (SELECT {feature_sql} FROM {source}) w
+        LEFT JOIN target_map m ON CAST(w.last_game_id AS BIGINT) = m.last_game_id
+        WHERE m.target_gr IS NOT NULL
+    """)
 
-    for feat in feature_list:
-        if feat not in df.columns:
-            continue
-        if df[feat].isna().all():
-            continue
+    baseline = con.execute("""
+        SELECT
+          COUNT(*) AS n,
+          AVG(target_gr >= 2) AS p_ge_2,
+          AVG(target_gr >= 5) AS p_ge_5,
+          AVG(target_gr >= 10) AS p_ge_10,
+          AVG(target_gr >= 20) AS p_ge_20,
+          AVG(target_gr >= 50) AS p_ge_50,
+          AVG(target_gr >= 100) AS p_ge_100
+        FROM base
+    """).df().iloc[0].to_dict()
 
-        feature_bucket = make_bucket_summary(df, feat)
-        bucket_summaries.append(feature_bucket)
+    all_rows = []
+    group_rows = []
+    for feature in features:
+        f = sql_ident(feature)
+        # approx_quantile menghindari qcut dan tidak membuat copy DataFrame besar.
+        for group_filter, group_name in [("TRUE", "ALL"), *[(f"window_size > {lo} AND window_size <= {hi}", name) for lo, hi, name in [(10,30,"11-30"),(30,50,"31-50"),(50,100,"51-100"),(100,250,"101-250"),(250,500,"251-500"),(500,1000,"501-1000"),(1000,2000,"1001-2000")]]]:
+            q = f"""
+              WITH q AS (
+                SELECT
+                  approx_quantile(CAST({f} AS DOUBLE), 0.2) q20,
+                  approx_quantile(CAST({f} AS DOUBLE), 0.4) q40,
+                  approx_quantile(CAST({f} AS DOUBLE), 0.6) q60,
+                  approx_quantile(CAST({f} AS DOUBLE), 0.8) q80
+                FROM base WHERE {group_filter} AND {f} IS NOT NULL
+              ), b AS (
+                SELECT *, CASE
+                  WHEN CAST({f} AS DOUBLE) <= q20 THEN 'q1'
+                  WHEN CAST({f} AS DOUBLE) <= q40 THEN 'q2'
+                  WHEN CAST({f} AS DOUBLE) <= q60 THEN 'q3'
+                  WHEN CAST({f} AS DOUBLE) <= q80 THEN 'q4'
+                  ELSE 'q5' END AS bucket
+                FROM base, q
+                WHERE {group_filter} AND {f} IS NOT NULL
+              )
+              SELECT '{feature}' feature, '{group_name}' window_group, bucket,
+                COUNT(*) n,
+                AVG(target_gr < 2) low_rate,
+                AVG(target_gr >= 2) p_ge_2,
+                AVG(target_gr >= 5) p_ge_5,
+                AVG(target_gr >= 10) p_ge_10,
+                AVG(target_gr >= 20) p_ge_20,
+                AVG(target_gr >= 50) p_ge_50,
+                AVG(target_gr >= 100) p_ge_100
+              FROM b GROUP BY bucket ORDER BY bucket
+            """
+            group_rows.append(con.execute(q).df())
 
-        by_window = summarize_by_window_group(df, feat)
-        by_window_group.append(by_window)
+        q_all = group_rows[-1] if False else None
+        # Global summary is derived from ALL rows with the same streaming query.
+        global_q = f"""
+          WITH q AS (
+            SELECT approx_quantile(CAST({f} AS DOUBLE), 0.2) q20,
+                   approx_quantile(CAST({f} AS DOUBLE), 0.4) q40,
+                   approx_quantile(CAST({f} AS DOUBLE), 0.6) q60,
+                   approx_quantile(CAST({f} AS DOUBLE), 0.8) q80
+            FROM base WHERE {f} IS NOT NULL
+          ), b AS (
+            SELECT *, CASE WHEN CAST({f} AS DOUBLE)<=q20 THEN 'q1'
+              WHEN CAST({f} AS DOUBLE)<=q40 THEN 'q2'
+              WHEN CAST({f} AS DOUBLE)<=q60 THEN 'q3'
+              WHEN CAST({f} AS DOUBLE)<=q80 THEN 'q4' ELSE 'q5' END bucket
+            FROM base, q WHERE {f} IS NOT NULL
+          )
+          SELECT '{feature}' feature, bucket, COUNT(*) n,
+            AVG(target_gr < 2) low_rate, AVG(target_gr >= 2) p_ge_2,
+            AVG(target_gr >= 5) p_ge_5, AVG(target_gr >= 10) p_ge_10,
+            AVG(target_gr >= 20) p_ge_20, AVG(target_gr >= 50) p_ge_50,
+            AVG(target_gr >= 100) p_ge_100 FROM b GROUP BY bucket ORDER BY bucket
+        """
+        all_rows.append(con.execute(global_q).df())
 
-    if not bucket_summaries:
-        raise ValueError("Tidak ada fitur yang valid untuk dianalisis.")
+    all_summary = pd.concat(all_rows, ignore_index=True)
+    group_summary = pd.concat(group_rows, ignore_index=True)
+    base_p = float(baseline["p_ge_2"])
+    top = (all_summary.groupby("feature", as_index=False)
+           .agg(avg_p_ge_2=("p_ge_2", "mean"), max_p_ge_2=("p_ge_2", "max"),
+                min_p_ge_2=("p_ge_2", "min"), n_buckets=("bucket", "count")))
+    top["max_lift_vs_baseline"] = top["max_p_ge_2"] / base_p
+    top["min_lift_vs_baseline"] = top["min_p_ge_2"] / base_p
+    top["range_p_ge_2"] = top["max_p_ge_2"] - top["min_p_ge_2"]
+    top = top.sort_values("range_p_ge_2", ascending=False)
 
-    feature_summary = pd.concat(bucket_summaries, ignore_index=True)
-    window_group_summary = pd.concat(by_window_group, ignore_index=True)
-    top_features = compute_top_features(feature_summary, baseline)
-
-    feature_summary.to_csv(args.out / "feature_bucket_summary.csv", index=False)
-    window_group_summary.to_csv(args.out / "feature_window_group_summary.csv", index=False)
-    top_features.to_csv(args.out / "top_features.csv", index=False)
-
-    summary = {
-        "baseline": baseline,
-        "n_total_rows": int(len(df)),
-        "n_features": int(len(feature_list)),
-        "top_features": top_features.head(20).to_dict(orient="records"),
-    }
-    (args.out / "feature_analysis_summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False),
+    all_summary.to_csv(a.out / "feature_bucket_summary.csv", index=False)
+    group_summary.to_csv(a.out / "feature_window_group_summary.csv", index=False)
+    top.to_csv(a.out / "top_features.csv", index=False)
+    (a.out / "feature_analysis_summary.json").write_text(
+        json.dumps({"baseline": baseline, "n_features": len(features), "n_rows_valid": int(baseline["n"])}, indent=2, default=float),
         encoding="utf-8",
     )
 
-    print(json.dumps({
-        "n_total_rows": int(len(df)),
-        "n_features": int(len(feature_list)),
-        "baseline": baseline,
-    }, indent=2, ensure_ascii=False))
-    print(f"\nOutput ditulis di: {args.out.resolve()}")
-    print("File utama:")
-    print("  - feature_bucket_summary.csv")
-    print("  - feature_window_group_summary.csv")
-    print("  - top_features.csv")
-    print("  - feature_analysis_summary.json")
+    print(json.dumps({"baseline": baseline, "n_features": len(features), "n_rows_valid": int(baseline["n"])}, indent=2, default=float))
+    print(f"Output ditulis ke: {a.out.resolve()}")
 
 
 if __name__ == "__main__":
